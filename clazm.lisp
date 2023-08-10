@@ -27,10 +27,11 @@
                        "np" 11 "p"  10
                        *condd*))
 
-(defclass line ()
-  ((filename :initarg :filename :reader line-filename)
-   (number :initarg :number :reader line-number)
-   (string :initarg :string :reader line-string)))
+(defstruct line
+  filename number string)
+
+(defstruct instruction
+  line name operands opcodes flags function)
 
 (define-condition bad-line (error)
   ((line :initarg :line
@@ -38,45 +39,21 @@
          :reader line))
   (:documentation "Encountered a malformed line in a file")
   (:report (lambda (condition stream)
-             (with-slots (filename number string) (line condition)
-               (format stream "~a:~a malformed line: \"~a\"~&" filename 
-                                                               number
-                                                               string)))))
-
-(defmethod print-object ((line line) stream)
-  (print-unreadable-object (line stream :type 'line)
-    (with-slots (filename number string) line
-      (format stream "~A \"~A\"" number string))))
-
-(defclass instruction ()
-  ((line :initarg :line :accessor instruction-line)
-   (name :initarg :name :accessor instruction-name)
-   (operands :initarg :operands :accessor instruction-operands)
-   (opcodes :initarg :opcodes :accessor instruction-opcodes)
-   (flags :initarg :flags :accessor instruction-flags)))
-
-(defmethod print-object ((ins instruction) stream)
-  (print-unreadable-object (ins stream :type 'instruction)
-    (with-slots (name operands opcodes flags) ins
-      (format stream "~A ~A ~A ~A" name operands opcodes flags))))
-
-(defclass instruction-function ()
-  ((instruction :initarg :instruction :accessor instruction-function-instruction)
-   (lambda :initarg :lambda :accessor instruction-function-lambda)))
-
-(defmethod print-object ((ins-f instruction-function) stream)
-  (print-unreadable-object (ins-f stream :type 'instruction-function)
-    (with-slots (instruction lambda) ins
-      (with-slots (name operands flags)
-       (format stream "~A ~A ~A")))))
+             (let* ((line (line condition))
+                    (filename (line-filename line))
+                    (number (line-number line))
+                    (string (line-string line)))
+               (format-symbol stream "~A:~A malformed line: \"~A\"~&" filename 
+                                                                      number
+                                                                      string)))))
 
 (defun read-lines (filename &optional (filter (constantly t)))
   (loop for line in (uiop:read-file-lines filename)
         for number from 1
         when (funcall filter line)
-          collect (make-instance 'line :filename filename
-                                       :number number
-                                       :string line)))
+          collect (make-line :filename filename
+                             :number number
+                             :string line)))
 
 (defun make-comment-char-filter (char &optional (whitespace " "))
   (lambda (line)
@@ -91,9 +68,10 @@
   (read-lines filename (make-comment-char-filter #\;)))
 
 (defun instruction-parse-fields (instruction)
-  (with-slots (name operands opcodes flags) instruction
-    (setf operands (cl-ppcre:split "," operands)
-          flags (cl-ppcre:split "," flags))
+  (let ((operands (instruction-operands instruction))
+        (flags (instruction-flags instruction)))
+    (setf (instruction-operands instruction) (cl-ppcre:split "," operands)
+          (instruction-flags instruction) (cl-ppcre:split "," flags))
     instruction))
 
 (defun instruction-name-expand-cc (name)
@@ -130,11 +108,11 @@
            (cc-names (instruction-name-expand-cc base-name)))
       (flet ((make-instruction (name &optional cc-value)
                (instruction-parse-fields
-                (make-instance 'instruction
-                               :name name
-                               :operands operands
-                               :opcodes (instruction-opcodes-patch-cc opcodes cc-value)
-                               :flags flags))))
+                (make-instruction :line line
+                                  :name name
+                                  :operands operands
+                                  :opcodes (instruction-opcodes-patch-cc opcodes cc-value)
+                                  :flags flags))))
         (cond (cc-names (loop for (cc-name . cc-value) in cc-names
                               collect (make-instruction cc-name cc-value)))
               (t (make-instruction base-name)))))))
@@ -153,15 +131,81 @@
   (with-slots (name operands opcodes flags) ins
     (push ins (gethash name db))))
 
+(defun instruction-relaxed-p (ins n)
+  "Is nth operand relaxed?"
+  (find #\* (nth n (instruction-operands ins))))
+
+(defvar *instruction-tuple-codes*
+  '((""    . 000)
+    ("fv"  . 001)
+    ("hv" . 002)
+    ("fvm" . 003)
+    ("t1s8" . 004)
+    ("t1s16" . 005)
+    ("t1s" . 006)
+    ("t1f32" . 007)
+    ("t1f64" . 010)
+    ("t2" . 011)
+    ("t4" . 012)
+    ("t8" . 013)
+    ("hvm" . 014)
+    ("qvm" . 015)
+    ("ovm" . 016)
+    ("m128" . 017)
+    ("dup" . 020)))
+
+(defun instruction-compile (ins)
+  (let* ((opcodes (instruction-opcodes ins))
+         (codestring (multiple-value-bind (match strings)
+                         (cl-ppcre:scan-to-strings "^\\s*\\[([^\\]]*)\\]\\s*$" opcodes)
+                       (when match (aref strings 0))))
+         (parts (multiple-value-bind (match strings)
+                    (cl-ppcre:scan-to-strings "^(([^\\s:]*)\\:*([^\\s:]*)\\:|)\\s*(.*\\S)\\s*$" codestring)
+                  (when match strings))))
+    (when parts
+      (let* ((opr (aref parts 1))
+             (tuple (aref parts 2))
+             (opc (aref parts 3))
+             oppos
+             (op (loop with op = 0
+                       for c across (or opr #())
+                       for i from 0
+                       do (cond ((char= #\+ c) (decf op))
+                                (t
+                                 (progn
+                                   (when (instruction-relaxed-p ins i)
+                                     (decf op))
+                                   (push (cons c op) oppos)
+                                   (incf op))))
+                          
+                       finally (return op)))
+             (tup (cdr (assoc tuple *instruction-tuple-codes* :test #'string=))))
+        (list `(opr . ,opr)
+              `(tuple . ,tuple)
+              `(opc . ,opc)
+              `(op . ,op)
+              `(oppos . ,oppos)
+              `(tup . ,tup))))))
+
 (defun insns-db-populate (&optional (db *instruction-db*))
   (mapcar (lambda (ins) (insns-db-push-1 ins db)) (insns-process))
   db)
 
+(defun insns-db-compile (&optional (db *instruction-db*))
+  (maphash (lambda (k v)
+             (declare (ignore k))
+             (mapcar (lambda (ins)
+                       (setf (instruction-function ins) (instruction-compile ins)))
+                     v))
+           db))
+
 (defun insns-db-print (&optional (db *instruction-db*))
   (maphash (lambda (k v)
-             (format t "~A ~A~%"
-                     k
-                     (loop for ins in v
-                           collect (with-slots (operands opcodes flags) ins
-                                     (list operands opcodes flags)))))
+             (format t "(~S ~S)~%" k v))
            db))
+
+(defun insns-developer-crank (&optional (db *instruction-db*))
+  (clrhash db)
+  (insns-db-populate db)
+  (insns-db-compile db)
+  (insns-db-print db))
