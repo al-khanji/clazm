@@ -14,15 +14,18 @@
 (defvar *regs.dat-line-scanner*
   (cl-ppcre:create-scanner "\\s*(\\S+)\\s*(\\S+)\\s*(\\S+)\\s*([0-9]+)\\s*(\\S*)"
                            :case-insensitive-mode t))
+(defvar *regs.dat-name-scanner*
+  (cl-ppcre:create-scanner "^(.*[^0-9])([0-9]+)\\-([0-9]+)(|[^0-9].*)$"))
+
 (defvar *insns.dat-line-scanner*
   (cl-ppcre:create-scanner "^\\s*(\\S+)\\s+(\\S+)\\s+(\\S+|\\[.*\\])\\s+(\\S+)\\s*$"))
 
-(defvar *condd* (list   "o"  0 "no"  1 "c"    2 "nc"  3
-                        "z"  4 "nz"  5 "na"   6 "a"   7
-                        "s"  8 "ns"  9 "pe"  10 "po" 11
-                        "l" 12 "nl" 13 "ng"  14 "g"  15))
-(defvar *conds* (list* "ae"  3 "b"   2 "be"   6 "e" 4
-                       "ge" 13 "le" 14 "nae"  2 "nb" 3
+(defvar *condd* (list   "o"  0 "no"  1 "c"    2 "nc"   3
+                        "z"  4 "nz"  5 "na"   6 "a"    7
+                        "s"  8 "ns"  9 "pe"  10 "po"  11
+                        "l" 12 "nl" 13 "ng"  14 "g"   15))
+(defvar *conds* (list* "ae"  3 "b"   2 "be"   6 "e"    4
+                       "ge" 13 "le" 14 "nae"  2 "nb"   3
                        "nbe" 7 "ne"  5 "nge" 12 "nle" 15
                        "np" 11 "p"  10
                        *condd*))
@@ -32,6 +35,9 @@
 
 (defstruct instruction
   line name operands opcodes flags function)
+
+(defstruct register
+  line name assembler-class disassembler-classes number token-flag)
 
 (define-condition bad-line (error)
   ((line :initarg :line
@@ -44,8 +50,8 @@
                     (number (line-number line))
                     (string (line-string line)))
                (format-symbol stream "~A:~A malformed line: \"~A\"~&" filename 
-                                                                      number
-                                                                      string)))))
+                              number
+                              string)))))
 
 (defun read-lines (filename &optional (filter (constantly t)))
   (loop for line in (uiop:read-file-lines filename)
@@ -63,6 +69,43 @@
 
 (defun regs-read-lines (&optional (filename *nasm/x86/regs.dat*))
   (read-lines filename (make-comment-char-filter #\#)))
+
+(defun regs-parse-line (line &optional (line-scanner *regs.dat-line-scanner*)
+                                       (name-scanner *regs.dat-name-scanner*))
+  (multiple-value-bind (match strings)
+      (cl-ppcre:scan-to-strings line-scanner (line-string line))
+    (when (not match)
+      (error 'bad-line :line line))
+    (let ((register-name (aref strings 0))
+          (assembler-class (aref strings 1))
+          (disassembler-classes (cl-ppcre:split "," (aref strings 2)))
+          (x86-register-number (parse-integer (aref strings 3)))
+          (token-flag (aref strings 4)))
+      (flet ((make-register (name &optional (num 0))
+               (make-register :line line
+                              :name name
+                              :assembler-class assembler-class
+                              :disassembler-classes disassembler-classes
+                              :number (+ x86-register-number num)
+                              :token-flag token-flag)))
+       (multiple-value-bind (match strings)
+           (cl-ppcre:scan-to-strings name-scanner register-name)
+         (cond (match (loop with bottom = (parse-integer (aref strings 1))
+                            with top = (parse-integer (aref strings 2))
+                            with prefix = (aref strings 0)
+                            with suffix = (aref strings 3)
+                            for i from bottom upto top
+                            for j from 0
+                            collect (make-register (format nil "~A~A~A" prefix i suffix) j)))
+               (t (make-register register-name))))))))
+
+(defun regs-process ()
+  (loop for line in (regs-read-lines)
+        for register = (regs-parse-line line)
+        if (listp register)
+          append register
+        else
+          collect register))
 
 (defun insns-read-lines (&optional (filename *nasm/x86/insns.dat*))
   (read-lines filename (make-comment-char-filter #\;)))
@@ -154,6 +197,80 @@
     ("m128" . 017)
     ("dup" . 020)))
 
+(defvar *plain-codes*
+  '("o16"                ; indicates fixed 16-bit operand size, i.e. optional 0x66
+    "o32"                ; indicates fixed 32-bit operand size, i.e. optional 0x66
+    "odf"                ; indicates that this instruction is only valid when the
+                         ; operand size is the default (instruction to disassembler,
+                         ; generates no code in the assembler)
+    "o64"                ; 64-bit operand size requiring REX.W
+    "o64nw"              ; Implied 64-bit operand size (no REX.W); REX on extensions only
+    "a16"                ; 16-bit address size, i.e. optional 0x67 
+    "a32"                ; 32-bit address size, i.e. optional 0x67
+    "adf"                ; (disassembler only) Address size is default
+    "a64"                ; fixed 64-bit address size, 0x67 invalid
+    "!osp"               ; operand-size prefix (0x66) not permitted
+    "!asp"               ; address-size prefix (0x67) not permitted
+    "f2i"                ; F2 prefix used as opcode extension, but 66 for operand size is OK
+    "f3i"                ; F3 prefix used as opcode extension, but 66 for operand size is OK
+    "mustrep"            ; force a REP(E) prefix (0xF3) even if not specified
+    "mustrepne"          ; force a REPNE prefix (0xF2) even if not specified
+    "rex.l"              ; LOCK prefix used as REX.R (used in non-64-bit mode)
+    "norexb"             ; (disassembler only) invalid with REX.B
+    "norexx"             ; (disassembler only) invalid with REX.X
+    "norexr"             ; (disassembler only) invalid with REX.R
+    "norexw"             ; (disassembler only) invalid with REX.W
+    "repe"               ; disassemble a rep (0xF3 byte) prefix as repe not rep
+    "nohi"               ; Use spl/bpl/sil/dil even without REX
+    "nof3"               ; No REP 0xF3 prefix permitted
+    "norep"              ; No REP prefix permitted
+    "wait"               ; Needs a wait prefix
+    "resb"               ; reserve <operand 0> bytes of uninitialized storage
+    "np"                 ; No prefix
+    "jcc8"               ; Match only if Jcc possible with single byte
+    "jmp8"               ; Match only if JMP possible with single byte
+    "jlen"               ; Length of jump; assemble 0x03 if bits==16, 0x05 if bits==32; used for conditional jump over longer jump
+    "hlexr"              ; instruction takes XRELEASE (F3) with or without lock
+    "hlenl"              ; instruction takes XACQUIRE/XRELEASE with or without lock
+    "hle"                ; instruction takes XACQUIRE/XRELEASE with lock only
+    "vsibx"              ; This instruction takes an XMM VSIB memory EA
+    "vm32x"              ; This instruction takes an XMM VSIB memory EA
+    "vm64x"              ; This instruction takes an XMM VSIB memory EA
+    "vsiby"              ; This instruction takes an YMM VSIB memory EA
+    "vm32y"              ; This instruction takes an YMM VSIB memory EA
+    "vm64y"              ; This instruction takes an YMM VSIB memory EA
+    "vsibz"              ; This instruction takes an ZMM VSIB memory EA
+    "vm32z"              ; This instruction takes an ZMM VSIB memory EA
+    "vm64z"              ; This instruction takes an ZMM VSIB memory EA
+    ))
+
+(defvar *imm-codes*
+  '("ib"        ; imm8
+    "ib,u"      ; Unsigned imm8
+    "iw"        ; imm16
+    "ib,s"      ; imm8 sign-extended to opsize or bits
+    "iwd"       ; imm16 or imm32, depending on opsize
+    "id"        ; imm32
+    "id,s"      ; imm32 sign-extended to 64 bits
+    "iwdq"      ; imm16/32/64, depending on addrsize
+    "rel8"      ; a byte relative operand, from operand 0..3
+    "iq"        ; a qword immediate operand, from operand 0..3
+    "rel16"     ; a word relative operand, from operand 0..3
+    "rel"       ; 16 or 32 bit relative operand; select between \6[0-3] and \7[0-3] depending on 16/32 bit
+                ; assembly mode or the operand-size override on the operand
+    "rel32"     ; a long relative operand, from operand 0..3
+    "seg"       ;  a word constant, from the _segment_ part of operand 0..3
+    ))
+
+(defun instruction-opcode-compile (opcode)
+  (cond
+    ((find opcode *plain-codes* :test #'string=) opcode)
+    ((find opcode *imm-codes* :test #'string=) opcode)
+    ((string= "/r" opcode) `(make-modrm ,opcode))
+    ((cl-ppcre:scan "/\\d" opcode) `(make-modrm ,opcode))
+    ((cl-ppcre:scan "^[0-9a-f]{2}$" opcode) `(emit-raw-byte ,opcode))
+    (t `(unknown ,opcode))))
+
 (defun instruction-compile (ins)
   (let* ((opcodes (instruction-opcodes ins))
          (codestring (multiple-value-bind (match strings)
@@ -177,7 +294,6 @@
                                      (decf op))
                                    (push (cons c op) oppos)
                                    (incf op))))
-                          
                        finally (return op)))
              (tup (cdr (assoc tuple *instruction-tuple-codes* :test #'string=))))
         (list `(opr . ,opr)
@@ -185,7 +301,9 @@
               `(opc . ,opc)
               `(op . ,op)
               `(oppos . ,oppos)
-              `(tup . ,tup))))))
+              `(tup . ,tup)
+              `(ops . ,(loop for op in (cl-ppcre:split " " opc)
+                             collect (instruction-opcode-compile op))))))))
 
 (defun insns-db-populate (&optional (db *instruction-db*))
   (mapcar (lambda (ins) (insns-db-push-1 ins db)) (insns-process))
